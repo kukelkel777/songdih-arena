@@ -361,6 +361,19 @@ function onLobbyMsg(m) {
     // 호스트가 보낸 전투 시작 (맵/모드 확정)
     console.log('[NET] 전투 시작 신호 수신', m);
     beginOnlineBattle(m.mode, m.mapIndex, m.hostLoadout);
+  } else if (m.type === 'input') {
+    // (호스트) 게스트 이동/조준 입력 저장
+    if (netRole === 'host') netPeerInput = m;
+  } else if (m.type === 'fire') {
+    // (호스트) 게스트 발사 → P2가 발사
+    if (netRole === 'host' && G && G.players[1]) fireBullet(G.players[1], m.ax, m.ay);
+  } else if (m.type === 'skill') {
+    // (호스트) 게스트 스킬 → P2가 시전
+    if (netRole === 'host' && G && G.players[1]) {
+      const g = G.players[1];
+      if (m.ax != null) { g._aimX = m.ax; g._aimY = m.ay; }
+      castSkill(g, m.slot);
+    }
   }
 }
 
@@ -1250,11 +1263,18 @@ function buildSkillTray() {
 // ─────────── INPUT ───────────
 const keys = {};
 let mouse = { x: W/2, y: H/2, down: false };
+// 온라인에서 내가 조종하는 플레이어 인덱스 (호스트=0, 게스트=1, 오프라인=0)
+function myIdx() { return (netOnline && netRole === 'guest') ? 1 : 0; }
+let netPeerInput = null;   // (호스트) 게스트로부터 받은 입력
 window.addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
-  if (k === ' ') e.preventDefault();   // 스페이스 스크롤 방지
+  if (k === ' ') e.preventDefault();
   keys[k] = true;
-  if (['q','w','e'].includes(k) && G && !G.over) castSkill(G.players[0], { q:0, w:1, e:2 }[k]);
+  if (['q','w','e'].includes(k) && G && !G.over) {
+    const slot = { q:0, w:1, e:2 }[k];
+    if (netOnline && netRole === 'guest') netSend('skill', { slot, ax: mouse.x, ay: mouse.y });
+    else castSkill(G.players[myIdx()], slot);
+  }
 });
 window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
 document.getElementById('arena').addEventListener('mousemove', e => {
@@ -1265,10 +1285,16 @@ document.getElementById('arena').addEventListener('mousemove', e => {
 document.getElementById('arena').addEventListener('mousedown', e => {
   e.preventDefault();
   if (!G || G.over) return;
-  const me = G.players[0];
+  const me = G.players[myIdx()];
   const po = me.loadout[3] ? orbById(me.loadout[3]) : null;
-  if (po && po.holdToFire) { me._tyCharging = true; me._tyT = 0; }       // 김태연 차징
-  else if (po && po.holdRepeat) { me._laserHold = true; me._laserT = 0; } // 김혜경 레이저 연사
+  if (netOnline && netRole === 'guest') {
+    if (po && po.holdToFire) { me._tyCharging = true; me._tyT = 0; }
+    else if (po && po.holdRepeat) { me._laserHold = true; me._laserT = 0; }
+    else netSend('fire', { ax: mouse.x, ay: mouse.y });
+    return;
+  }
+  if (po && po.holdToFire) { me._tyCharging = true; me._tyT = 0; }
+  else if (po && po.holdRepeat) { me._laserHold = true; me._laserT = 0; }
   else fireBullet(me, mouse.x, mouse.y);
 });
 document.getElementById('arena').addEventListener('mouseup', e => {
@@ -1427,8 +1453,17 @@ function makeAPI(self) {
     fx: (x, y, color, n) => spawnFx(x, y, color, n),
     float: (txt, color) => G.floats.push({ x: self.x, y: self.y - self.r - 10, text: txt, color, life: 800, max: 800 }),
     float2: (target, txt, color) => G.floats.push({ x: target.x, y: target.y - target.r - 10, text: txt, color, life: 800, max: 800 }),
-    aim: () => self.isAI ? G.aiAim : mouse,
+    aim: () => getAim(self),
   };
+}
+
+// 플레이어의 조준점 (로컬=마우스, AI=aiAim, 원격=받은 좌표)
+function getAim(p) {
+  if (G && G.online) {
+    if (p.team === myIdx()) return mouse;          // 내 캐릭터
+    return { x: p._aimX != null ? p._aimX : W/2, y: p._aimY != null ? p._aimY : FLOOR-40 };
+  }
+  return p.isAI ? G.aiAim : mouse;
 }
 
 function castSkill(p, slot) {
@@ -1580,17 +1615,33 @@ function update(dt) {
     if (G.timer <= 0) { G.timer = 0; endRoundDamage(); }
   }
 
-  // AI think
-  if (G.players[1].isAI) aiControl(G.players[1], dt);
+  // AI think — 온라인에선 AI 끔 (양쪽 다 사람)
+  if (!G.online && G.players[1].isAI) aiControl(G.players[1], dt);
 
-  // human input → P1 (PC: 키보드 / 모바일: 조이스틱이 moveDir 직접 설정)
-  const p1 = G.players[0];
+  // 내 캐릭터 이동/점프 입력 (호스트=P1, 게스트=P2)
+  const me = G.players[myIdx()];
   if (!G.roundOver) {
     if (!isMobile) {
-      p1.moveDir = (keys['d']?1:0) - (keys['a']?1:0);
-      if (keys[' '] && p1.onGround) { p1.vy = -JUMP; p1.onGround = false; }
+      me.moveDir = (keys['d']?1:0) - (keys['a']?1:0);
+      if (keys[' '] && me.onGround) { me.vy = -JUMP; me.onGround = false; }
     }
-  } else p1.moveDir = 0;
+  } else me.moveDir = 0;
+
+  // 온라인 입력 동기화
+  if (G.online) {
+    if (netRole === 'guest') {
+      // 게스트: 내 입력을 호스트로 전송 (이동·조준·점프요청)
+      netSend('input', { moveDir: me.moveDir, aimX: mouse.x, aimY: mouse.y, jump: (keys[' ']||false) });
+    } else if (netRole === 'host' && netPeerInput) {
+      // 호스트: 게스트 입력을 P2에 적용
+      const g = G.players[1];
+      if (!G.roundOver) {
+        g.moveDir = netPeerInput.moveDir || 0;
+        if (netPeerInput.jump && g.onGround) { g.vy = -JUMP; g.onGround = false; }
+        g._aimX = netPeerInput.aimX; g._aimY = netPeerInput.aimY;
+      } else g.moveDir = 0;
+    }
+  }
 
   // physics + per-orb passive
   G.players.forEach(p => {
