@@ -374,6 +374,9 @@ function onLobbyMsg(m) {
       if (m.ax != null) { g._aimX = m.ax; g._aimY = m.ay; }
       castSkill(g, m.slot);
     }
+  } else if (m.type === 'state') {
+    // (게스트) 호스트가 보낸 게임 상태 수신
+    if (netRole === 'guest') { _netSnapPrev = _netSnap; _netSnap = m.s; }
   }
 }
 
@@ -1590,19 +1593,84 @@ let lastT = 0;
 function tick(now) {
   const dt = Math.min(40, now - lastT); lastT = now;
   try {
-    if (!G.over) {
+    if (G.online && netRole === 'guest') {
+      // 게스트: 물리 계산 안 함. 입력만 보내고, 받은 상태를 보간하며 렌더
+      guestSendInput();
+      guestInterpolate(dt);
+      render();
+    } else if (!G.over) {
       if (G.hitStop > 0) {
-        // 힛스톱: 화면 정지 (갱신 없이 렌더만), 끝나면 사망 처리
         G.hitStop -= dt;
         render();
         if (G.hitStop <= 0 && G.pendingDeath) { const d = G.pendingDeath; G.pendingDeath = null; endRoundHp(d); }
       } else {
         update(dt); render();
+        if (G.online && netRole === 'host') hostBroadcastState();
       }
+    } else {
+      render();
     }
   }
   catch (err) { console.error(err); cancelAnimationFrame(loop); return; }
   loop = requestAnimationFrame(tick);
+}
+
+// 호스트: 게임 상태를 게스트에게 전송 (초당 ~30회)
+let _lastBroadcast = 0;
+function hostBroadcastState() {
+  const now = performance.now();
+  if (now - _lastBroadcast < 33) return;   // ~30Hz
+  _lastBroadcast = now;
+  const snap = {
+    players: G.players.map(p => ({
+      x: Math.round(p.x), y: Math.round(p.y), hp: p.hp, face: p.face,
+      team: p.team, vx: Math.round(p.vx*10)/10, vy: Math.round(p.vy*10)/10,
+    })),
+    proj: G.projectiles.map(pr => ({
+      x: Math.round(pr.x), y: Math.round(pr.y), r: pr.r, color: pr.color,
+      word: pr.word || null, baseball: pr.baseball || false, laser: pr.laser || false,
+    })),
+    walls: G.walls.map(w => ({ x: w.x, y: w.y, w: w.w, h: w.h })),
+    mops: G.mops.map(m => ({ x: m.x, y: m.y, r: m.r })),
+    pools: G.pools.map(p => ({ x: p.x, y: p.y, r: p.r })),
+    waves: G.waves.map(w => ({ x: w.x, y: w.y, r: w.r })),
+    wins: G.wins, round: G.round, banner: G.banner, mapIndex: (mapIndex-1+3)%3,
+    over: G.over, roundOver: G.roundOver, timer: Math.round(G.timer),
+  };
+  netSend('state', { s: snap });
+}
+
+// 게스트: 내 입력 전송
+function guestSendInput() {
+  if (!G || G.roundOver) return;
+  const me = G.players[1];
+  if (!isMobile && me) {
+    me.moveDir = (keys['d']?1:0) - (keys['a']?1:0);
+  }
+  netSend('input', { moveDir: me ? me.moveDir : 0, aimX: mouse.x, aimY: mouse.y, jump: (keys[' ']||false) });
+}
+
+// 게스트: 받은 상태를 부드럽게 적용 (보간)
+let _netSnap = null, _netSnapPrev = null;
+function guestInterpolate(dt) {
+  if (!_netSnap || !G) return;
+  const s = _netSnap;
+  // 플레이어 위치 보간
+  s.players.forEach((sp, i) => {
+    const p = G.players[i];
+    if (!p) return;
+    p.x += (sp.x - p.x) * 0.4;   // 부드럽게 따라감
+    p.y += (sp.y - p.y) * 0.4;
+    p.hp = sp.hp; p.face = sp.face;
+  });
+  // 투사체·이펙트는 받은 그대로 교체
+  G.projectiles = s.proj.map(pr => ({ ...pr, owner: -1 }));
+  G.walls = s.walls.map(w => ({ ...w, owner: -1 }));
+  G.mops = s.mops.map(m => ({ ...m, owner: -1 }));
+  G.pools = s.pools.map(p => ({ ...p }));
+  G.waves = s.waves.map(w => ({ ...w }));
+  G.wins = s.wins; G.round = s.round; G.banner = s.banner;
+  G.over = s.over; G.roundOver = s.roundOver; G.timer = s.timer;
 }
 
 function update(dt) {
