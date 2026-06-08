@@ -286,6 +286,7 @@ let netRole = null;       // 'host' | 'guest' | null (오프라인)
 let netRoom = null;       // 현재 방 코드
 let netReady = false;     // 상대까지 입장 완료
 let myNetId = Math.random().toString(36).slice(2);   // 내 임시 ID
+let netSubscribed = false;   // 채널 구독 완료 여부 (REST 폴백 방지)
 
 function sbReady() { return SUPABASE_URL.startsWith('http') && SUPABASE_KEY.length > 20; }
 function initSb() {
@@ -320,6 +321,7 @@ function netJoinRoom(code, role, { onPeerJoin, onPeerLeave, onMsg } = {}) {
   });
   netChannel.subscribe(async (status) => {
     console.log('[NET] 채널 상태:', status);
+    netSubscribed = (status === 'SUBSCRIBED');
     if (status === 'SUBSCRIBED') {
       await netChannel.track({ id: myNetId, role });
       console.log('[NET] track 완료 (내 입장 등록)');
@@ -328,15 +330,17 @@ function netJoinRoom(code, role, { onPeerJoin, onPeerLeave, onMsg } = {}) {
   return true;
 }
 
-// 메시지 전송
+// 메시지 전송 (WebSocket 구독 완료 후에만 — REST 폴백/429 방지)
 function netSend(type, data) {
-  if (!netChannel) return;
-  netChannel.send({ type: 'broadcast', event: 'msg', payload: { from: myNetId, type, ...data } });
+  if (!netChannel || !netSubscribed) return;
+  try {
+    netChannel.send({ type: 'broadcast', event: 'msg', payload: { from: myNetId, type, ...data } });
+  } catch (e) { /* 전송 실패 무시 */ }
 }
 
 function netLeave() {
   if (netChannel) { try { netChannel.unsubscribe(); } catch(e){} netChannel = null; }
-  netRole = null; netRoom = null; netReady = false;
+  netRole = null; netRoom = null; netReady = false; netSubscribed = false;
   netPeerLoadout = null; netMyReady = false; netPeerReady = false;
 }
 
@@ -1594,8 +1598,9 @@ function tick(now) {
   const dt = Math.min(40, now - lastT); lastT = now;
   try {
     if (G.online && netRole === 'guest') {
-      // 게스트: 물리 계산 안 함. 입력만 보내고, 받은 상태를 보간하며 렌더
+      // 게스트: 입력 전송 → 내 캐릭터 예측 → 받은 상태로 보정 → 렌더
       guestSendInput();
+      guestPredict(dt);
       guestInterpolate(dt);
       render();
     } else if (!G.over) {
@@ -1619,7 +1624,7 @@ function tick(now) {
 let _lastBroadcast = 0;
 function hostBroadcastState() {
   const now = performance.now();
-  if (now - _lastBroadcast < 33) return;   // ~30Hz
+  if (now - _lastBroadcast < 50) return;   // ~20Hz (429 방지)
   _lastBroadcast = now;
   const snap = {
     players: G.players.map(p => ({
@@ -1641,13 +1646,15 @@ function hostBroadcastState() {
 }
 
 // 게스트: 내 입력 전송
+let _lastInputSend = 0;
 function guestSendInput() {
-  if (!G || G.roundOver) return;
+  if (!G) return;
+  const now = performance.now();
+  if (now - _lastInputSend < 50) return;   // ~20Hz (429 방지)
+  _lastInputSend = now;
   const me = G.players[1];
-  if (!isMobile && me) {
-    me.moveDir = (keys['d']?1:0) - (keys['a']?1:0);
-  }
-  netSend('input', { moveDir: me ? me.moveDir : 0, aimX: mouse.x, aimY: mouse.y, jump: (keys[' ']||false) });
+  const md = (!isMobile && me) ? ((keys['d']?1:0) - (keys['a']?1:0)) : (me ? me.moveDir : 0);
+  netSend('input', { moveDir: md, aimX: mouse.x, aimY: mouse.y, jump: (keys[' ']||false) });
 }
 
 // 게스트: 받은 상태를 부드럽게 적용 (보간)
@@ -1655,15 +1662,23 @@ let _netSnap = null, _netSnapPrev = null;
 function guestInterpolate(dt) {
   if (!_netSnap || !G) return;
   const s = _netSnap;
-  // 플레이어 위치 보간
   s.players.forEach((sp, i) => {
     const p = G.players[i];
     if (!p) return;
-    p.x += (sp.x - p.x) * 0.4;   // 부드럽게 따라감
-    p.y += (sp.y - p.y) * 0.4;
-    p.hp = sp.hp; p.face = sp.face;
+    if (i === 1) {
+      // 내 캐릭터(P2): 로컬 예측으로 즉시 움직이고, 큰 차이일 때만 부드럽게 보정
+      const dx = sp.x - p.x, dy = sp.y - p.y;
+      const drift = Math.hypot(dx, dy);
+      if (drift > 90) { p.x = sp.x; p.y = sp.y; }       // 너무 어긋나면 스냅
+      else { p.x += dx * 0.12; p.y += dy * 0.12; }       // 약하게 당겨 맞춤
+      p.hp = sp.hp;
+    } else {
+      // 상대(P1=호스트): 받은 위치로 보간
+      p.x += (sp.x - p.x) * 0.4;
+      p.y += (sp.y - p.y) * 0.4;
+      p.hp = sp.hp; p.face = sp.face;
+    }
   });
-  // 투사체·이펙트는 받은 그대로 교체
   G.projectiles = s.proj.map(pr => ({ ...pr, owner: -1 }));
   G.walls = s.walls.map(w => ({ ...w, owner: -1 }));
   G.mops = s.mops.map(m => ({ ...m, owner: -1 }));
@@ -1671,6 +1686,40 @@ function guestInterpolate(dt) {
   G.waves = s.waves.map(w => ({ ...w }));
   G.wins = s.wins; G.round = s.round; G.banner = s.banner;
   G.over = s.over; G.roundOver = s.roundOver; G.timer = s.timer;
+}
+
+// 게스트 로컬 예측: 내 캐릭터(P2)를 입력대로 즉시 움직임 (간이 물리)
+function guestPredict(dt) {
+  if (!G || G.roundOver) return;
+  const me = G.players[1];
+  if (!me || me.hp <= 0) return;
+  if (!isMobile) me.moveDir = (keys['d']?1:0) - (keys['a']?1:0);
+  // 점프
+  if (keys[' '] && me.onGround) { me.vy = -JUMP; me.onGround = false; }
+  // 중력·이동 (호스트 물리와 동일 상수)
+  me.vy += GRAV;
+  const maxSpd = MOVE * (me.onGround ? 1 : 1.4);
+  if (me.moveDir) {
+    const target = me.moveDir * maxSpd, accel = me.onGround ? 0.5 : 0.32;
+    me.vx += (target - me.vx) * accel;
+  } else { me.vx *= me.onGround ? GROUND_FRIC : AIR_FRIC; }
+  me.x += me.vx; me.y += me.vy;
+  if (Math.abs(me.vx) > 0.3) me.face = me.vx > 0 ? 1 : -1;
+  // 경계·바닥 (간이)
+  if (me.x < me.r) { me.x = me.r; me.vx = 0; }
+  if (me.x > W - me.r) { me.x = W - me.r; me.vx = 0; }
+  if (me.y < me.r) { me.y = me.r; if (me.vy < 0) me.vy = 0; }
+  me.onGround = false;
+  if (me.y >= FLOOR - me.r) { me.y = FLOOR - me.r; me.vy = 0; me.onGround = true; }
+  // 발판/블록 착지 (간이: resolveSolid/얇은발판 위)
+  (G.platforms||[]).forEach(pf => {
+    if (pf.shape === 'triangle') { resolveTriangle(me, pf.tri); return; }
+    if (pf.h > 24) { resolveSolid(me, pf); return; }
+    const top = pf.y - pf.h/2;
+    if (me.vy >= 0 && Math.abs(me.x - pf.x) < pf.w/2 + me.r*0.5 && me.y + me.r >= top && me.y + me.r <= top + 20) {
+      me.y = top - me.r; me.vy = 0; me.onGround = true;
+    }
+  });
 }
 
 function update(dt) {
