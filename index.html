@@ -163,6 +163,7 @@
   .back-link { color: var(--muted); font-size: 12px; margin-top: 30px; cursor: pointer; letter-spacing: 1px; }
   .back-link:hover { color: var(--ink); }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
 
@@ -274,6 +275,62 @@ let equipped = [null, null, null, null];   // 3 active (Q/E/R) + 1 passive (P)
 let isMobile = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;   // 터치기기면 기본 모바일
 let mapIndex = 0;   // 맵을 순서대로 순환
 let mapFloorSafe = false;   // 현재 맵의 바닥이 안전한 벽인지
+
+// ─────────── 온라인(Supabase) 설정 ───────────
+// ↓↓↓ 여기에 본인 Supabase 값을 넣으세요 (REST 경로 없이 순수 URL) ↓↓↓
+const SUPABASE_URL = 'https://rxfzrfxvktfecqkvnhme.supabase.co/rest/v1/';      // 예: https://xxxx.supabase.co
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ4ZnpyZnh2a3RmZWNxa3ZuaG1lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA4NTI4NTksImV4cCI6MjA5NjQyODg1OX0.aLKEfZiPJRi3Nok6mwh1dWA2LD-vpffvxy5bkwm_uVg';         // eyJ... 로 시작하는 anon public key
+let sb = null;            // supabase 클라이언트
+let netChannel = null;    // 현재 방 채널
+let netRole = null;       // 'host' | 'guest' | null (오프라인)
+let netRoom = null;       // 현재 방 코드
+let netReady = false;     // 상대까지 입장 완료
+let myNetId = Math.random().toString(36).slice(2);   // 내 임시 ID
+
+function sbReady() { return SUPABASE_URL.startsWith('http') && SUPABASE_KEY.length > 20; }
+function initSb() {
+  if (sb) return sb;
+  if (!sbReady()) return null;
+  sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+    realtime: { params: { eventsPerSecond: 30 } },
+  });
+  return sb;
+}
+
+// 방 채널 입장 (role: 'host'|'guest'). onPeerJoin: 상대 입장 시, onMsg: 메시지 수신
+function netJoinRoom(code, role, { onPeerJoin, onPeerLeave, onMsg } = {}) {
+  if (!initSb()) { alert('온라인 설정이 필요합니다 (Supabase URL/KEY 미입력)'); return false; }
+  netRoom = code; netRole = role; netReady = false;
+  netChannel = sb.channel('room-' + code, { config: { presence: { key: myNetId } } });
+  // 메시지 수신
+  netChannel.on('broadcast', { event: 'msg' }, ({ payload }) => {
+    if (payload && payload.from !== myNetId && onMsg) onMsg(payload);
+  });
+  // 입장/퇴장 감지 (presence)
+  netChannel.on('presence', { event: 'sync' }, () => {
+    const state = netChannel.presenceState();
+    const count = Object.keys(state).length;
+    if (count >= 2 && !netReady) { netReady = true; if (onPeerJoin) onPeerJoin(); }
+  });
+  netChannel.on('presence', { event: 'leave' }, () => {
+    if (onPeerLeave) onPeerLeave();
+  });
+  netChannel.subscribe(async (status) => {
+    if (status === 'SUBSCRIBED') { await netChannel.track({ id: myNetId, role }); }
+  });
+  return true;
+}
+
+// 메시지 전송
+function netSend(type, data) {
+  if (!netChannel) return;
+  netChannel.send({ type: 'broadcast', event: 'msg', payload: { from: myNetId, type, ...data } });
+}
+
+function netLeave() {
+  if (netChannel) { try { netChannel.unsubscribe(); } catch(e){} netChannel = null; }
+  netRole = null; netRoom = null; netReady = false;
+}
 
 // ─────────── ORB DEFINITIONS ───────────
 // Each orb gives norm a skill. Hooks:
@@ -636,8 +693,32 @@ function segDist(ax, ay, bx, by, px, py) {
 function show(id) { document.querySelectorAll('.screen').forEach(s => s.classList.remove('active')); document.getElementById(id).classList.add('active'); }
 function randCode() { const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; return Array.from({length:5}, () => c[Math.floor(Math.random()*c.length)]).join(''); }
 
-document.getElementById('btnCreate').onclick = () => { document.getElementById('roomCode').value = randCode(); show('create'); };
+document.getElementById('btnCreate').onclick = () => {
+  const code = randCode();
+  document.getElementById('roomCode').value = code;
+  show('create');
+  // 온라인 설정이 돼 있으면 호스트로 방 채널 접속 (연결 테스트)
+  if (sbReady()) {
+    netJoinRoom(code, 'host', {
+      onPeerJoin: () => { console.log('[NET] 상대 입장!'); netStatus('상대가 입장했습니다! ✓'); },
+      onPeerLeave: () => { console.log('[NET] 상대 퇴장'); netStatus('상대가 나갔습니다'); },
+      onMsg: (m) => console.log('[NET] 수신:', m),
+    });
+    netStatus('방 생성됨 · 상대를 기다리는 중...');
+  } else {
+    netStatus('(오프라인 모드 — Supabase 미설정)');
+  }
+};
 document.getElementById('btnJoin').onclick = () => show('join');
+function netStatus(txt) {
+  let el = document.getElementById('netStatus');
+  if (!el) {
+    el = document.createElement('div'); el.id = 'netStatus';
+    el.style.cssText = 'margin-top:14px;font-size:13px;color:var(--muted);text-align:center';
+    const c = document.getElementById('create'); if (c) c.appendChild(el);
+  }
+  el.textContent = txt;
+}
 document.getElementById('btnSettings').onclick = () => {
   isMobile = !isMobile;
   document.getElementById('modeLabel').textContent = isMobile ? '모바일' : 'PC';
@@ -656,9 +737,17 @@ document.querySelectorAll('.mode-card').forEach(c => c.onclick = () => {
 
 document.getElementById('btnCreateGo').onclick = () => { buildLoadout(); show('loadout'); };
 document.getElementById('btnJoinGo').onclick = () => {
-  const code = document.getElementById('joinCode').value.trim();
+  const code = document.getElementById('joinCode').value.trim().toUpperCase();
   if (code.length < 3) { document.getElementById('joinCode').style.borderColor = '#c0392b'; return; }
-  selMode = 'rounds';   // 입장 시 기본 모드 (실제 온라인이면 방장이 정한 모드)
+  if (sbReady()) {
+    netJoinRoom(code, 'guest', {
+      onPeerJoin: () => { console.log('[NET] 호스트와 연결됨!'); netSend('hello', { msg: '게스트 입장' }); },
+      onPeerLeave: () => console.log('[NET] 상대 퇴장'),
+      onMsg: (m) => console.log('[NET] 수신:', m),
+    });
+    alert('방 ' + code + ' 에 접속 시도 중... (콘솔에서 연결 확인)');
+  }
+  selMode = 'rounds';
   buildLoadout(); show('loadout');
 };
 
