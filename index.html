@@ -338,6 +338,15 @@ function netSend(type, data) {
   } catch (e) { /* 전송 실패 무시 */ }
 }
 
+// 상대가 나감 → 게임 중단하고 메뉴로
+function handlePeerLeft() {
+  if (!netOnline) return;
+  if (loop) cancelAnimationFrame(loop);
+  netLeave(); netOnline = false; G = null;
+  alert('상대가 나갔습니다. 메뉴로 돌아갑니다.');
+  show('menu');
+}
+
 function netLeave() {
   if (netChannel) { try { netChannel.unsubscribe(); } catch(e){} netChannel = null; }
   netRole = null; netRoom = null; netReady = false; netSubscribed = false;
@@ -381,6 +390,26 @@ function onLobbyMsg(m) {
   } else if (m.type === 'state') {
     // (게스트) 호스트가 보낸 게임 상태 수신
     if (netRole === 'guest') { _netSnapPrev = _netSnap; _netSnap = m.s; }
+  } else if (m.type === 'round') {
+    // (게스트) 새 라운드 — 맵을 호스트와 동일하게 재생성
+    if (netRole === 'guest' && G) {
+      mapIndex = m.mapIndex;   // 호스트가 만든 맵 인덱스
+      G.platforms = makePlatforms();   // 같은 맵 생성 (mapIndex 증가)
+      G.round = m.round;
+      G.roundFreeze = 1200;
+    }
+  } else if (m.type === 'gameover') {
+    // (게스트) 매치 종료
+    if (netRole === 'guest') {
+      G.over = true;
+      const txt = m.guestWon ? 'VICTORY' : (m.draw ? '무승부' : 'DEFEAT');
+      document.getElementById('resultText').textContent = txt;
+      document.getElementById('resultText').style.color = m.guestWon ? 'var(--accent2)' : (m.draw ? 'var(--muted)' : 'var(--accent)');
+      show('result');
+    }
+  } else if (m.type === 'bye') {
+    // 상대가 나감
+    handlePeerLeft();
   }
 }
 
@@ -766,7 +795,10 @@ document.getElementById('btnCreate').onclick = () => {
         netStatus('상대 입장! 로드아웃 선택으로 이동합니다...');
         setTimeout(() => { buildLoadout(); show('loadout'); updateReadyUI(); }, 600);
       },
-      onPeerLeave: () => { netStatus('상대가 나갔습니다'); netPeerReady = false; updateReadyUI(); },
+      onPeerLeave: () => {
+        if (G && G.online) { handlePeerLeft(); return; }
+        netStatus('상대가 나갔습니다'); netPeerReady = false; updateReadyUI();
+      },
       onMsg: onLobbyMsg,
     });
     netStatus('방 생성됨 · 상대를 기다리는 중...');
@@ -790,10 +822,14 @@ document.getElementById('btnSettings').onclick = () => {
 };
 document.getElementById('modeLabel').textContent = isMobile ? '모바일' : 'PC';
 document.getElementById('btnReroll').onclick = () => document.getElementById('roomCode').value = randCode();
-document.getElementById('backFromCreate').onclick = () => show('menu');
-document.getElementById('backFromJoin').onclick = () => show('menu');
-document.getElementById('backFromLoadout').onclick = () => show('menu');
-document.getElementById('backToMenu').onclick = () => show('menu');
+function leaveOnlineToMenu() {
+  if (netOnline) { netSend('bye', {}); netLeave(); netOnline = false; }
+  show('menu');
+}
+document.getElementById('backFromCreate').onclick = leaveOnlineToMenu;
+document.getElementById('backFromJoin').onclick = leaveOnlineToMenu;
+document.getElementById('backFromLoadout').onclick = leaveOnlineToMenu;
+document.getElementById('backToMenu').onclick = leaveOnlineToMenu;
 
 document.querySelectorAll('.mode-card').forEach(c => c.onclick = () => {
   document.querySelectorAll('.mode-card').forEach(x => x.classList.remove('sel'));
@@ -811,7 +847,10 @@ document.getElementById('btnJoinGo').onclick = () => {
         netSend('hello', { msg: '게스트 입장' });
         buildLoadout(); show('loadout'); updateReadyUI();
       },
-      onPeerLeave: () => { netPeerReady = false; updateReadyUI(); },
+      onPeerLeave: () => {
+        if (G && G.online) { handlePeerLeft(); return; }
+        netPeerReady = false; updateReadyUI();
+      },
       onMsg: onLobbyMsg,
     });
     document.getElementById('btnJoinGo').textContent = '접속 중...';
@@ -2129,22 +2168,40 @@ function nextRound() {
   G.round++;
   G.platforms = makePlatforms();
   const sp = spawnPoints();
-  G.players[0] = makePlayer(0, sp[0].x, equipped, false); G.players[0].y = sp[0].y;
-  G.players[1] = makePlayer(1, sp[1].x, pickAILoadout(), true); G.players[1].y = sp[1].y;
+  if (G.online) {
+    const hostLo = (netRole === 'host') ? equipped.slice() : netPeerLoadout;
+    const guestLo = (netRole === 'host') ? netPeerLoadout : equipped.slice();
+    G.players[0] = makePlayer(0, sp[0].x, hostLo || pickAILoadout(), false); G.players[0].y = sp[0].y;
+    G.players[1] = makePlayer(1, sp[1].x, guestLo || pickAILoadout(), false); G.players[1].y = sp[1].y;
+  } else {
+    G.players[0] = makePlayer(0, sp[0].x, equipped, false); G.players[0].y = sp[0].y;
+    G.players[1] = makePlayer(1, sp[1].x, pickAILoadout(), true); G.players[1].y = sp[1].y;
+  }
   G.projectiles = []; G.walls = []; G.mines = []; G.particles = []; G.waves = []; G.mops = []; G.clones = []; G.pools = [];
   G.roundOver = false; G.roundFreeze = 1200; G.hitStop = 0; G.pendingDeath = null;
   setBanner('ROUND ' + G.round);
+  // 호스트는 새 라운드 정보(맵 인덱스)를 게스트에 알림
+  if (G.online && netRole === 'host') {
+    netSend('round', { round: G.round, mapIndex: (mapIndex - 1 + 3) % 3 });
+  }
 }
 
 function endMatch(winner) {
   G.over = true;
+  // 온라인: 호스트가 게스트에 결과 전송 (게스트 관점 승패)
+  if (G.online && netRole === 'host') {
+    netSend('gameover', { guestWon: winner === 1, draw: winner === -1 });
+  }
   const txt = winner === -1 ? '무승부' : (winner === 0 ? 'VICTORY' : 'DEFEAT');
   document.getElementById('resultText').textContent = txt;
   document.getElementById('resultText').style.color = winner === 0 ? 'var(--accent2)' : (winner === 1 ? 'var(--accent)' : 'var(--muted)');
   show('result');
 }
 
-document.getElementById('btnRematch').onclick = () => startGame();
+document.getElementById('btnRematch').onclick = () => {
+  if (netOnline) { leaveOnlineToMenu(); }   // 온라인 재대결은 아직 → 메뉴로
+  else startGame();
+};
 
 // ─────────── HUD ───────────
 function updateHUD() {
